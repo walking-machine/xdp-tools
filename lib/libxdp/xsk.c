@@ -77,6 +77,7 @@ struct xsk_ctx {
 	int xsks_map_fd;
 	struct list_head list;
 	struct xdp_program *xdp_prog;
+	int refcnt_map_fd;
 	char ifname[IFNAMSIZ];
 };
 
@@ -503,7 +504,8 @@ static void xsk_delete_map_entry(int xsks_map_fd, __u32 queue_id)
 	close(xsks_map_fd);
 }
 
-static int xsk_lookup_bpf_map(int prog_fd)
+static int xsk_lookup_map_by_filter(int prog_fd,
+				    bool (*map_info_filter)(struct bpf_map_info *map_info))
 {
 	__u32 i, *map_ids, num_maps, prog_len = sizeof(struct bpf_prog_info);
 	__u32 map_len = sizeof(struct bpf_map_info);
@@ -543,8 +545,7 @@ static int xsk_lookup_bpf_map(int prog_fd)
 			continue;
 		}
 
-		if (!strncmp(map_info.name, "xsks_map", sizeof(map_info.name)) &&
-		    map_info.key_size == 4 && map_info.value_size == 4) {
+		if (map_info_filter(&map_info)) {
 			xsks_map_fd = fd;
 			break;
 		}
@@ -554,6 +555,35 @@ static int xsk_lookup_bpf_map(int prog_fd)
 
 	free(map_ids);
 	return xsks_map_fd;
+}
+
+static bool xsk_map_is_socket_map(struct bpf_map_info *map_info)
+{
+	return !strncmp(map_info->name, "xsks_map", sizeof(map_info->name)) &&
+		map_info->key_size == 4 && map_info->value_size == 4;
+}
+
+static bool xsk_map_is_refcnt_map(struct bpf_map_info *map_info)
+{
+	/* In order to avoid confusing users with multiple identically named
+	 * maps, libbpf names non-custom internal maps (.data, .bss, etc.)
+	 * in an unexpected way, namely the first 8 characters of a bpf object
+	 * name + a suffix signifying the internal map type,
+	 * ex. "xdp_def_" + ".data".
+	 */
+	return !strncmp(map_info->name, "xsk_def_.data",
+			sizeof(map_info->name)) &&
+			map_info->value_size >= sizeof(int);
+}
+
+static int xsk_lookup_bpf_map(int prog_fd)
+{
+	return xsk_lookup_map_by_filter(prog_fd, &xsk_map_is_socket_map);
+}
+
+static int xsk_lookup_refcnt_map(int prog_fd)
+{
+	return xsk_lookup_map_by_filter(prog_fd, &xsk_map_is_refcnt_map);
 }
 
 #ifdef HAVE_LIBBPF_BPF_MAP_CREATE
@@ -683,6 +713,60 @@ out:
 	return prog;
 }
 
+static int xsk_update_prog_refcnt(int refcnt_map_fd, int delta)
+{
+	struct bpf_map_info map_info = {};
+	__u32 info_len = sizeof(map_info);
+	__u32 refcnt_offset = 0, key = 0;
+	int lock_fd, ret, *value;
+	void *value_data = NULL;
+
+	lock_fd = xdp_lock_acquire();
+	if (lock_fd < 0)
+		return lock_fd;
+
+	ret = bpf_obj_get_info_by_fd(refcnt_map_fd, &map_info, &info_len);
+	if (ret)
+		goto unlock;
+
+	value_data = malloc(map_info.value_size);
+	if (!value_data) {
+		ret = -ENOMEM;
+		goto unlock;
+	}
+
+	ret = bpf_map_lookup_elem(refcnt_map_fd, &key, value_data);
+	if (ret)
+		goto unlock;
+
+	value = value_data + refcnt_offset;
+
+	/* If refcount is 0, program is awaiting detach and can't be used */
+	if (*value) {
+		*value += delta;
+		ret = bpf_map_update_elem(refcnt_map_fd, &key, value_data, 0);
+		if (ret)
+			goto unlock;
+	}
+
+	ret = *value;
+unlock:
+	xdp_lock_release(lock_fd);
+	if (value_data)
+		free(value_data);
+	return ret;
+}
+
+static int xsk_incr_prog_refcnt(int refcnt_map_fd)
+{
+	return xsk_update_prog_refcnt(refcnt_map_fd, 1);
+}
+
+static int xsk_decr_prog_refcnt(int refcnt_map_fd)
+{
+	return xsk_update_prog_refcnt(refcnt_map_fd, -1);
+}
+
 static int __xsk_setup_xdp_prog(struct xsk_socket *xsk, int *xsks_map_fd)
 {
 	const char *fallback_prog = "xsk_def_xdp_prog_5.3.o";
@@ -695,6 +779,34 @@ static int __xsk_setup_xdp_prog(struct xsk_socket *xsk, int *xsks_map_fd)
 	ctx->xdp_prog = xsk_lookup_program(ctx->ifindex);
 	if (IS_ERR(ctx->xdp_prog))
 		return PTR_ERR(ctx->xdp_prog);
+
+	if (ctx->xdp_prog) {
+		int refcnt;
+
+		ctx->refcnt_map_fd = xsk_lookup_refcnt_map(xdp_program__fd(ctx->xdp_prog));
+		if (ctx->refcnt_map_fd == -ENOENT) {
+			pr_warn("AF_XDP refcount map was not found. If you want to use built-in refcount, please recreate your sockets with XDP program that contains int variable in .data section\n");
+			ctx->refcnt_map_fd = 0;
+			goto map_lookup;
+		}
+
+		if (ctx->refcnt_map_fd < 0) {
+			err = ctx->refcnt_map_fd;
+			pr_warn("Error getting refcount map\n");
+			ctx->refcnt_map_fd = 0;
+			goto err_prog_load;
+		}
+
+		refcnt = xsk_incr_prog_refcnt(ctx->refcnt_map_fd);
+		if (refcnt < 2) {
+			pr_warn("Could not update current refcount: %d, falling back on creating a new program\n",
+				refcnt);
+			close(ctx->refcnt_map_fd);
+			ctx->refcnt_map_fd = 0;
+			xdp_program__close(ctx->xdp_prog);
+			ctx->xdp_prog = NULL;
+		}
+	}
 
 	if (!ctx->xdp_prog) {
 		file_name = xsk_check_redirect_flags() ? default_prog : fallback_prog;
@@ -714,6 +826,15 @@ static int __xsk_setup_xdp_prog(struct xsk_socket *xsk, int *xsks_map_fd)
 		attached = true;
 	}
 
+	if (!ctx->refcnt_map_fd) {
+		ctx->refcnt_map_fd = xsk_lookup_refcnt_map(xdp_program__fd(ctx->xdp_prog));
+		if (ctx->refcnt_map_fd < 0) {
+			if (ctx->refcnt_map_fd == -ENOENT)
+				pr_warn("AF_XDP refcount map was not found. If you want to use built-in refcount, please recreate your sockets with XDP program that contains int variable in .data section\n");
+			ctx->refcnt_map_fd = 0;
+		}
+	}
+map_lookup:
 	ctx->xsks_map_fd = xsk_lookup_bpf_map(xdp_program__fd(ctx->xdp_prog));
 	if (ctx->xsks_map_fd < 0) {
 		err = ctx->xsks_map_fd;
@@ -735,6 +856,9 @@ err_lookup:
 		xdp_program__detach(ctx->xdp_prog, ctx->ifindex,
 				    xsk_convert_xdp_flags(xsk->config.xdp_flags), 0);
 err_prog_load:
+	if (ctx->refcnt_map_fd)
+		close(ctx->refcnt_map_fd);
+	ctx->refcnt_map_fd = 0;
 	xdp_program__close(ctx->xdp_prog);
 	ctx->xdp_prog = NULL;
 	return err;
@@ -1093,6 +1217,27 @@ int xsk_umem__delete(struct xsk_umem *umem)
 	return 0;
 }
 
+static void xsk_release_xdp_prog(struct xsk_socket *xsk)
+{
+	struct xsk_ctx *ctx = xsk->ctx;
+	int value;
+
+	if (!xsk->ctx->refcnt_map_fd)
+		goto ret;
+
+	value = xsk_decr_prog_refcnt(ctx->refcnt_map_fd);
+	if (value < 0)
+		pr_warn("Error occurred when decrementing xsk XDP prog refcount: %d, please detach program yourself\n",
+			value);
+	if (value)
+		goto ret;
+
+	xdp_program__detach(ctx->xdp_prog, ctx->ifindex,
+			    xsk_convert_xdp_flags(xsk->config.xdp_flags), 0);
+ret:
+	xdp_program__close(ctx->xdp_prog);
+}
+
 void xsk_socket__delete(struct xsk_socket *xsk)
 {
 	size_t desc_sz = sizeof(struct xdp_desc);
@@ -1108,7 +1253,7 @@ void xsk_socket__delete(struct xsk_socket *xsk)
 	umem = ctx->umem;
 	if (ctx->xdp_prog) {
 		xsk_delete_map_entry(ctx->xsks_map_fd, ctx->queue_id);
-		xdp_program__close(ctx->xdp_prog);
+		xsk_release_xdp_prog(xsk);
 	}
 
 	err = xsk_get_mmap_offsets(xsk->fd, &off);

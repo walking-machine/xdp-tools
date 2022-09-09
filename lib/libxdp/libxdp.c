@@ -380,7 +380,7 @@ err:
 	return ERR_PTR(err);
 }
 
-static int xdp_lock_acquire()
+int xdp_lock_acquire()
 {
 	int lock_fd, err;
 	const char *dir;
@@ -409,7 +409,7 @@ static int xdp_lock_acquire()
 	return lock_fd;
 }
 
-static int xdp_lock_release(int lock_fd)
+int xdp_lock_release(int lock_fd)
 {
 	int err;
 
